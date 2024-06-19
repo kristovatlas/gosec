@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -310,6 +311,27 @@ func exit(issues []*issue.Issue, errors map[string][]gosec.Error, noFail bool) {
 	os.Exit(0)
 }
 
+// Clean up generated .gno.go flies
+func deleteGnoGoFiles(rootDir string) error {
+	err := filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.HasSuffix(info.Name(), ".gno.go") {
+			//fmt.Printf("Deleting file: %s\n", path)
+			err := os.Remove(path)
+			if err != nil {
+				return fmt.Errorf("failed to delete file %q: %w", path, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("error walking directory %q: %w", rootDir, err)
+	}
+	return nil
+}
+
 func main() {
 	// Makes sure some version information is set
 	prepareVersionInfo()
@@ -407,6 +429,7 @@ func main() {
 	}
 	for _, path := range paths {
 		pcks, err := gosec.PackagePaths(path, excludedDirs)
+		//logger.Println("DEBUG: Length of package paths in main() is ", len(pcks), " and err is ", err)
 		if err != nil {
 			logger.Fatal(err)
 		}
@@ -422,6 +445,7 @@ func main() {
 		buildTags = strings.Split(*flagBuildTags, ",")
 	}
 
+	//logger.Println("DEBUG: About to process packages: ", packages, " w/ buildTags: ", buildTags)
 	if err := analyzer.Process(buildTags, packages...); err != nil {
 		logger.Fatal(err)
 	}
@@ -461,6 +485,10 @@ func main() {
 		if err := saveReport(*flagOutput, *flagFormat, rootPaths, reportInfo); err != nil {
 			logger.Fatal(err)
 		}
+	}
+
+	for _, pkg := range packages {
+		deleteGnoGoFiles(pkg)
 	}
 
 	// Finalize logging

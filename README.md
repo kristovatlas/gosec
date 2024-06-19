@@ -1,3 +1,7 @@
+# gnosec PoC
+
+This is a PoC for adapting the gosec tool to process gno code from gno.land. Because gosec uses https://pkg.go.dev/golang.org/x/tools/go/packages#Load to process Go files, this implements a workaround of temporarily copying over .gno files to .gno.go. This allows some .gno files to be successfully processed, while inducing golang errors in others. For example, running this tool on `gno/examples/gno.land/p/demo/` results in approximately 124 errors (mostly related to package names, imports, etc.) and 84 identified issues.
+
 
 # gosec - Go Security Checker
 

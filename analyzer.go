@@ -21,6 +21,7 @@ import (
 	"go/build"
 	"go/token"
 	"go/types"
+	"io"
 	"log"
 	"os"
 	"path"
@@ -238,6 +239,7 @@ func (gosec *Analyzer) LoadRules(ruleDefinitions map[string]RuleBuilder, ruleSup
 
 // Process kicks off the analysis process for a given package
 func (gosec *Analyzer) Process(buildTags []string, packagePaths ...string) error {
+	//gosec.logger.Println("DEBUG: Entered Process() for packagePaths: ", packagePaths)
 	config := &packages.Config{
 		Mode:       LoadMode,
 		BuildFlags: buildTags,
@@ -261,16 +263,19 @@ func (gosec *Analyzer) Process(buildTags []string, packagePaths ...string) error
 			select {
 			case s := <-j:
 				pkgs, err := gosec.load(s, config)
+				//gosec.logger.Println("DEBUG: ", len(pkgs), " packages returned from load().")
 				select {
 				case r <- result{pkgPath: s, pkgs: pkgs, err: err}:
 				case <-quit:
 					// we've been told to stop, probably an error while
 					// processing a previous result.
+					//gosec.logger.Println("DEBUG: in case quit in Process().")
 					wg.Done()
 					return
 				}
 			default:
 				// j is empty and there are no jobs left
+				//gosec.logger.Println("DEBUG: in case default with no jobs in Process().")
 				wg.Done()
 				return
 			}
@@ -280,6 +285,7 @@ func (gosec *Analyzer) Process(buildTags []string, packagePaths ...string) error
 	// fill the buffer
 	for _, pkgPath := range packagePaths {
 		jobs <- pkgPath
+		//gosec.logger.Println("DEBUG: Added ", pkgPath, " to job buffer.")
 	}
 
 	for i := 0; i < gosec.concurrency; i++ {
@@ -297,6 +303,7 @@ func (gosec *Analyzer) Process(buildTags []string, packagePaths ...string) error
 			gosec.AppendError(r.pkgPath, r.err)
 		}
 		for _, pkg := range r.pkgs {
+			//gosec.logger.Println("DEBUG: pkg.Name=", pkg.Name)
 			if pkg.Name != "" {
 				err := gosec.ParseErrors(pkg)
 				if err != nil {
@@ -313,7 +320,63 @@ func (gosec *Analyzer) Process(buildTags []string, packagePaths ...string) error
 	return nil
 }
 
+func copyFile(src, dst string) error {
+	//fmt.Println("DEBUG: Entered copyFile src=", src, " dst=", dst)
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	/*
+		// Check if the destination file already exists
+		_, err = os.Stat(dst)
+		if err == nil {
+			// Destination file exists, generate a unique filename
+			base := filepath.Base(dst)
+			dir := filepath.Dir(dst)
+			ext := filepath.Ext(base)
+			filename := strings.TrimSuffix(base, ext)
+
+			var newDst string
+			counter := 1
+			for {
+				newFilename := fmt.Sprintf("%s.%d%s", filename, counter, ext)
+				newDst = filepath.Join(dir, newFilename)
+				_, err := os.Stat(newDst)
+				if os.IsNotExist(err) {
+					break
+				}
+				counter++
+			}
+
+			dst = newDst
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	*/
+
+	destinationFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destinationFile.Close()
+
+	_, err = io.Copy(destinationFile, sourceFile)
+	if err != nil {
+		return err
+	}
+
+	err = destinationFile.Sync()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (gosec *Analyzer) load(pkgPath string, conf *packages.Config) ([]*packages.Package, error) {
+	//gosec.logger.Println("DEBUG: Entered load pkgPath=", pkgPath)
 	abspath, err := GetPkgAbsPath(pkgPath)
 	if err != nil {
 		gosec.logger.Printf("Skipping: %s. Path doesn't exist.", abspath)
@@ -321,23 +384,68 @@ func (gosec *Analyzer) load(pkgPath string, conf *packages.Config) ([]*packages.
 	}
 
 	gosec.logger.Println("Import directory:", abspath)
+
 	// step 1/3 create build context.
 	buildD := build.Default
+
 	// step 2/3: add build tags to get env dependent files into basePackage.
 	gosec.mu.Lock()
 	buildD.BuildTags = conf.BuildFlags
 	gosec.mu.Unlock()
+
 	basePackage, err := buildD.ImportDir(pkgPath, build.ImportComment)
-	if err != nil {
+	if err != nil && !strings.Contains(err.Error(), "no buildable Go source files") { // Ignore "no Go files" error
+		//gosec.logger.Println("DEBUG: Error importing directory:", err)
 		return []*packages.Package{}, fmt.Errorf("importing dir %q: %w", pkgPath, err)
 	}
 
 	var packageFiles []string
-	for _, filename := range basePackage.GoFiles {
-		packageFiles = append(packageFiles, path.Join(pkgPath, filename))
+
+	// Include .go files if any
+	if basePackage != nil {
+		//gosec.logger.Println("DEBUG: Looking for go files in load()...")
+		for _, filename := range basePackage.GoFiles {
+			pkgFile := path.Join(pkgPath, filename)
+			//gosec.logger.Println("DEBUG: Adding to packageFiles: ", pkgFile, " where pkgPath=", pkgPath)
+			packageFiles = append(packageFiles, pkgFile)
+		}
+		for _, filename := range basePackage.CgoFiles {
+			packageFiles = append(packageFiles, path.Join(pkgPath, filename))
+		}
 	}
-	for _, filename := range basePackage.CgoFiles {
-		packageFiles = append(packageFiles, path.Join(pkgPath, filename))
+
+	// Include .gno files
+	//gosec.logger.Println("DEBUG: Looking recursively for gno files in load() in ", pkgPath, "...")
+
+	// Walk through directory recursively to find .gno files
+	err = filepath.Walk(pkgPath, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			//gosec.logger.Println("DEBUG: Error walking directory:", err)
+			return fmt.Errorf("walking directory %q: %w", pkgPath, err)
+		}
+		if !info.IsDir() && strings.HasSuffix(info.Name(), ".gno") {
+			// Construct destination .go file path
+			goFilePath := filePath + ".go"
+
+			// Copy .gno file to .go file
+			err := copyFile(filePath, goFilePath)
+			//gosec.logger.Println("DEBUG: Copied .gno file to .go file:", goFilePath)
+
+			if err != nil {
+				//gosec.logger.Println("DEBUG: Error copying file:", err)
+				return fmt.Errorf("copying file %q to %q: %w", filePath, goFilePath, err)
+			}
+
+			// Add .go file path to packageFiles
+			packageFiles = append(packageFiles, goFilePath)
+			//gosec.logger.Println("DEBUG: Added .gno file: ", goFilePath)
+		}
+		return nil
+	})
+
+	if err != nil {
+		//gosec.logger.Println("Error walking directory:", err)
+		return []*packages.Package{}, fmt.Errorf("walking directory %q: %w", pkgPath, err)
 	}
 
 	if gosec.tests {
@@ -353,10 +461,15 @@ func (gosec *Analyzer) load(pkgPath string, conf *packages.Config) ([]*packages.
 	gosec.mu.Lock()
 	conf.BuildFlags = nil
 	defer gosec.mu.Unlock()
+	//gosec.logger.Println("DEBUG: packageFiles length=", len(packageFiles), " packageFiles=", packageFiles)
+
 	pkgs, err := packages.Load(conf, packageFiles...)
 	if err != nil {
+		//gosec.logger.Println("DEBUG: Encountered error loading packages: ", err)
 		return []*packages.Package{}, fmt.Errorf("loading files from package %q: %w", pkgPath, err)
 	}
+	//gosec.logger.Println("DEBUG: Returning ", len(pkgs), " packages from load(): ", pkgs)
+
 	return pkgs, nil
 }
 
@@ -372,7 +485,7 @@ func (gosec *Analyzer) CheckRules(pkg *packages.Package) {
 		checkedFile := fp.Name()
 		// Skip the no-Go file from analysis (e.g. a Cgo files is expanded in 3 different files
 		// stored in the cache which do not need to by analyzed)
-		if filepath.Ext(checkedFile) != ".go" {
+		if filepath.Ext(checkedFile) != ".go" && filepath.Ext(checkedFile) != ".gno" {
 			continue
 		}
 		if gosec.excludeGenerated && ast.IsGenerated(file) {

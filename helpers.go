@@ -449,9 +449,10 @@ func PackagePaths(root string, excludes []*regexp.Regexp) ([]string, error) {
 	}
 	paths := map[string]bool{}
 	err := filepath.Walk(root, func(path string, f os.FileInfo, err error) error {
-		if filepath.Ext(path) == ".go" {
+		if filepath.Ext(path) == ".go" || filepath.Ext(path) == ".gno" {
 			path = filepath.Dir(path)
 			if isExcluded(filepath.ToSlash(path), excludes) {
+				fmt.Println("DEBUG: ", path, " is excluded based on regex in PackagePaths().")
 				return nil
 			}
 			paths[path] = true
